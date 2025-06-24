@@ -254,13 +254,13 @@ def main():
     }
     
     # TTS configuration (optional - set to None to disable TTS)
-    tts_config = None  # Disable TTS for now
-    # tts_config = {
-    #     "provider": "azure",
-    #     "speech_key": "your_azure_speech_key",
-    #     "speech_region": "your_azure_region",
-    #     "voice": "en-US-AriaNeural"
-    # }
+    # tts_config = None  # Disable TTS for now
+    tts_config = {
+        "provider": "azure",
+        "speech_key": os.environ.get("AZURE_SPEECH_KEY"),  # Replace with actual key
+        "speech_region": os.environ.get("AZURE_SPEECH_REGION"),   # Replace with actual region
+        "voice": "en-US-RyanMultilingualNeural"
+    }
     
     # Create processor
     processor = RedditToVideoProcessor(reddit_creds, tts_config)

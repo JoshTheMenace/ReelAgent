@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime
 import tempfile
 import shutil
+from dotenv import load_dotenv
+load_dotenv()
 
 # Video processing - MoviePy 2.x compatible imports
 try:
@@ -739,8 +741,8 @@ def main():
     # TTS configuration (optional - requires Azure Cognitive Services)
     tts_config = {
         "provider": "azure",
-        "speech_key": "your_speech_key",  # Replace with actual key
-        "speech_region": "your_region",   # Replace with actual region
+        "speech_key": os.environ.get("AZURE_SPEECH_KEY"),  # Replace with actual key
+        "speech_region": os.environ.get("AZURE_SPEECH_REGION"),   # Replace with actual region
         "voice": "en-US-AriaNeural"
     }
     
