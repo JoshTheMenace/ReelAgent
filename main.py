@@ -7,6 +7,7 @@ import logging
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 # Import your video creation classes - MoviePy 2.x compatible
@@ -154,9 +155,10 @@ class RedditToVideoProcessor:
     
     def create_video_from_post(self, subreddit_name: str, post_index: int = 0,
                              platform: str = "youtube_shorts", max_comments: int = 5,
-                             output_filename: str = None, quality: str = "medium") -> str:
+                             output_filename: str = None, quality: str = "medium",
+                             use_tts_for_comments: bool = True, background_video_path: str = None) -> str:
         """
-        Create a video from a Reddit post with comments
+        Create a video from a Reddit post with comments using subtitles
         
         Args:
             subreddit_name: Subreddit to get post from
@@ -165,6 +167,8 @@ class RedditToVideoProcessor:
             max_comments: Maximum comments to include
             output_filename: Output video filename
             quality: Video quality ('low', 'medium', 'high')
+            use_tts_for_comments: Whether to add TTS narration for comments
+            background_video_path: Path to background video file
             
         Returns:
             Path to created video file
@@ -183,30 +187,67 @@ class RedditToVideoProcessor:
                 output_filename = f"reddit_video_{safe_title}_{timestamp}.mp4"
             
             # Initialize video creator
-            self.logger.info("Creating video...")
+            self.logger.info("Creating video with subtitles...")
             reddit_video = RedditVideoHandler(self.video_config, self.tts_config)
             
             # Set platform
             reddit_video.set_platform(platform)
             
-            # Calculate video duration based on content
-            base_duration = 8  # Base time for post title
-            comment_duration = len(comments_list) * 3  # 3 seconds per comment
-            total_duration = base_duration + comment_duration
-            
-            # Add background
-            reddit_video.add_background_color((20, 20, 30), duration=total_duration)
-            
-            # Add the Reddit post and comments
-            reddit_video.add_reddit_post(post_data, comments_list)
-            
-            # Add TTS narration if configured
+            # Add main post TTS narration first to calculate timing
+            main_tts_duration = 0
             if self.tts_config:
                 narration_text = f"Here's an interesting post from r/{post_data['subreddit']}: {post_data['title']}"
-                reddit_video.add_tts_narration(narration_text, start_time=0)
+                self.logger.info("Generating main post TTS with subtitles...")
+                main_tts_duration, word_timings = reddit_video.add_tts_narration_with_subtitles(
+                    narration_text, start_time=0
+                )
+            
+            # Calculate total video duration dynamically
+            base_duration = max(6, main_tts_duration + 1)  # At least 6 seconds for title display
+            
+            # Temporarily add background to get timing
+            if background_video_path and os.path.exists(background_video_path):
+                reddit_video.add_background_video(background_video_path, duration=120)  # Temporary duration
+                self.logger.info(f"Using background video: {background_video_path}")
+            else:
+                reddit_video.add_background_color((20, 20, 30), duration=120)  # Temporary duration
+                if background_video_path:
+                    self.logger.warning(f"Background video not found: {background_video_path}, using solid color")
+            
+            # Add the Reddit post and comments - this returns the actual end time
+            self.logger.info("Adding Reddit post and comments with subtitle timing...")
+            actual_end_time = reddit_video.add_reddit_post_with_subtitles(
+                post_data, 
+                comments_list, 
+                use_tts_for_comments=use_tts_for_comments and self.tts_config is not None
+            )
+            
+            # Calculate the real total duration needed
+            total_duration = max(actual_end_time, base_duration) + 3  # Add 3 seconds buffer
+            
+            # Reset and recreate with correct duration
+            reddit_video.reset()
+            reddit_video.set_platform(platform)
+            
+            # Add background with correct duration
+            if background_video_path and os.path.exists(background_video_path):
+                reddit_video.add_background_video(background_video_path, duration=total_duration)
+            else:
+                reddit_video.add_background_color((20, 20, 30), duration=total_duration)
+            
+            # Re-add main TTS narration with subtitles
+            if self.tts_config:
+                reddit_video.add_tts_narration_with_subtitles(narration_text, start_time=0)
+            
+            # Re-add the Reddit post and comments with subtitles
+            reddit_video.add_reddit_post_with_subtitles(
+                post_data, 
+                comments_list, 
+                use_tts_for_comments=use_tts_for_comments and self.tts_config is not None
+            )
             
             # Render video
-            self.logger.info(f"Rendering video to {output_filename}...")
+            self.logger.info(f"Rendering video to {output_filename}... (duration: {total_duration:.1f}s)")
             final_path = reddit_video.render_video(output_filename, quality=quality)
             
             # Cleanup
@@ -244,7 +285,7 @@ class RedditToVideoProcessor:
         print("="*60)
 
 def main():
-    """Example usage"""
+    """Example usage with subtitle-based format and background video"""
     
     # Reddit API credentials
     reddit_creds = {
@@ -253,32 +294,60 @@ def main():
         "user_agent": os.environ.get("REDDIT_USER_AGENT")
     }
     
-    # TTS configuration (optional - set to None to disable TTS)
-    # tts_config = None  # Disable TTS for now
+    # TTS configuration
     tts_config = {
         "provider": "azure",
-        "speech_key": os.environ.get("AZURE_SPEECH_KEY"),  # Replace with actual key
-        "speech_region": os.environ.get("AZURE_SPEECH_REGION"),   # Replace with actual region
+        "speech_key": os.environ.get("AZURE_SPEECH_KEY"),
+        "speech_region": os.environ.get("AZURE_SPEECH_REGION"),
         "voice": "en-US-RyanMultilingualNeural"
     }
+    
+    # Validate that TTS config is available
+    if not tts_config["speech_key"] or not tts_config["speech_region"]:
+        print("⚠️  Warning: Azure Speech Services credentials not found in environment variables")
+        print("   Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file")
+        print("   TTS features will be disabled")
+        tts_config = None
+    
+    # Background video path - replace with your video file
+    background_video = "parkour.mp4"  # Change this to your background video path
+    
+    # Check if background video exists
+    if not os.path.exists(background_video):
+        print(f"⚠️  Background video not found: {background_video}")
+        print("   Using solid color background instead")
+        print("   Place your background video file in the same directory and update the path")
+        background_video = None
+    else:
+        print(f"✅ Found background video: {background_video}")
     
     # Create processor
     processor = RedditToVideoProcessor(reddit_creds, tts_config)
     
-    # Create video from first post in r/python with top 5 comments
+    # Create video from post with subtitle-based comments
     try:
         video_path = processor.create_video_from_post(
-            subreddit_name="python",
+            subreddit_name="askreddit",  # Good subreddit for interesting comments
             post_index=0,  # First post
             platform="youtube_shorts",
-            max_comments=5,
-            quality="medium"
+            max_comments=2,  # Reduced to 2 comments for testing and shorter videos
+            quality="medium",
+            use_tts_for_comments=True,  # Enable TTS with subtitles for comments
+            background_video_path=background_video  # Use background video
         )
         
-        print(f"\n✅ Success! Video saved as: {video_path}")
+        print(f"\n✅ Success! Subtitle-based video saved as: {video_path}")
+        print("\n🎥 Video Features:")
+        print("   • Background video (or solid color if video not found)")
+        print("   • Clean, readable subtitles")
+        print("   • TTS narration for all comments")
+        print("   • No comment bubbles - modern subtitle-only format")
+        print("   • Proper audio timing with no overlaps")
         
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

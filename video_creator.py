@@ -6,8 +6,6 @@ from pathlib import Path
 from datetime import datetime
 import tempfile
 import shutil
-from dotenv import load_dotenv
-load_dotenv()
 
 # Video processing - MoviePy 2.x compatible imports
 try:
@@ -114,29 +112,127 @@ class TextToSpeechEngine:
                 )
                 self.speech_config.speech_synthesis_voice_name = kwargs.get("voice", "en-US-AriaNeural")
     
-    def text_to_audio(self, text: str, output_path: str = None) -> str:
-        """Convert text to audio file"""
+    def text_to_audio_with_timing(self, text: str, output_path: str = None) -> tuple:
+        """Convert text to audio file and return path, duration, and word timings"""
         if not output_path:
             output_path = tempfile.mktemp(suffix=".wav")
         
         if self.provider == "azure" and hasattr(self, 'speech_config'):
             try:
+                # Configure for word boundary events
                 synthesizer = speechsdk.SpeechSynthesizer(
                     speech_config=self.speech_config,
                     audio_config=speechsdk.audio.AudioOutputConfig(filename=output_path)
                 )
+                
+                # Track word timings
+                word_timings = []
+                
+                def word_boundary_cb(evt):
+                    try:
+                        # Handle different data types from Azure SDK
+                        if hasattr(evt.audio_offset, 'total_seconds'):
+                            # It's a timedelta object
+                            start_time = float(evt.audio_offset.total_seconds())
+                        else:
+                            # It's already a number (in 100-nanosecond units)
+                            start_time = float(evt.audio_offset) / 10000000.0
+                        
+                        if hasattr(evt, 'duration'):
+                            if hasattr(evt.duration, 'total_seconds'):
+                                # It's a timedelta object
+                                duration = float(evt.duration.total_seconds())
+                            else:
+                                # It's already a number (in 100-nanosecond units)
+                                duration = float(evt.duration) / 10000000.0
+                        else:
+                            duration = 0.3  # Default duration
+                        
+                        word_timings.append({
+                            'word': str(evt.text),
+                            'start_time': start_time,
+                            'duration': duration
+                        })
+                    except Exception as e:
+                        # Skip problematic word boundaries rather than logging spam
+                        pass
+                
+                # Connect the callback
+                synthesizer.synthesis_word_boundary.connect(word_boundary_cb)
+                
                 result = synthesizer.speak_text_async(text).get()
                 
                 if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    return output_path
+                    # Get actual duration from the audio file
+                    duration = self._get_audio_duration(output_path)
+                    
+                    # If we didn't get word timings, estimate them
+                    if not word_timings:
+                        word_timings = self._estimate_word_timings(text, duration)
+                    
+                    return output_path, duration, word_timings
                 else:
                     raise Exception(f"TTS failed: {result.reason}")
             except Exception as e:
-                logging.warning(f"Azure TTS failed: {e}, falling back to silent audio")
-                return self._create_silent_audio(len(text) * 0.1, output_path)
+                logging.warning(f"Azure TTS with timing failed: {e}, falling back to estimated timing")
+                duration = len(text) * 0.08  # Estimate: 0.08 seconds per character
+                word_timings = self._estimate_word_timings(text, duration)
+                return self._create_silent_audio(duration, output_path), duration, word_timings
         else:
-            # Fallback: create silent audio as placeholder
-            return self._create_silent_audio(len(text) * 0.1, output_path)
+            # Fallback: create silent audio with estimated timing
+            duration = len(text) * 0.08  # Estimate: 0.08 seconds per character
+            word_timings = self._estimate_word_timings(text, duration)
+            return self._create_silent_audio(duration, output_path), duration, word_timings
+    
+    def _estimate_word_timings(self, text: str, total_duration: float) -> List[Dict]:
+        """Estimate word timings when real timing isn't available"""
+        words = text.split()
+        if not words:
+            return []
+        
+        # Estimate based on word length and average speech rate
+        word_timings = []
+        current_time = 0.0
+        
+        # Calculate average time per character
+        total_chars = sum(len(word) for word in words)
+        time_per_char = total_duration / max(total_chars, 1)
+        
+        for word in words:
+            word_duration = len(word) * time_per_char + 0.1  # Add small pause
+            word_timings.append({
+                'word': word,
+                'start_time': current_time,
+                'duration': word_duration
+            })
+            current_time += word_duration
+        
+        return word_timings
+    
+    def text_to_audio(self, text: str, output_path: str = None) -> tuple:
+        """Convert text to audio file and return path and duration (backward compatibility)"""
+        audio_path, duration, _ = self.text_to_audio_with_timing(text, output_path)
+        return audio_path, duration
+    
+    def _get_audio_duration(self, audio_path: str) -> float:
+        """Get duration of audio file"""
+        try:
+            from moviepy import AudioFileClip
+            audio = AudioFileClip(audio_path)
+            duration = float(audio.duration)  # Ensure it's a float
+            audio.close()
+            return duration
+        except Exception as e:
+            self.logger.warning(f"Could not get audio duration: {e}")
+            # Fallback: estimate based on file size
+            try:
+                import os
+                file_size = os.path.getsize(audio_path)
+                # Rough estimate: WAV files at 44.1kHz, 16-bit, stereo ~ 176KB per second
+                estimated_duration = file_size / (44100 * 2 * 2)
+                return max(1.0, float(estimated_duration))  # Minimum 1 second, ensure float
+            except:
+                return 3.0  # Default fallback
     
     def _create_silent_audio(self, duration: float, output_path: str) -> str:
         """Create silent audio as fallback"""
@@ -272,15 +368,24 @@ class VideoCreator:
         except Exception as e:
             self.logger.warning(f"Failed to create text clip with preferred method: {e}")
             try:
-                # Fallback - try minimal parameters
+                # Fallback - try with minimal parameters and positional arguments
                 if MOVIEPY_VERSION == 2:
-                    text_clip = TextClip(text, font_size=font_size)
+                    text_clip = TextClip(text)
+                    if hasattr(text_clip, 'with_font_size'):
+                        text_clip = text_clip.with_font_size(font_size)
                 else:
                     text_clip = TextClip(text, fontsize=font_size)
                 return text_clip
             except Exception as e2:
                 self.logger.error(f"Failed to create text clip with fallback: {e2}")
-                raise e2
+                # Last resort - create with just text
+                try:
+                    if MOVIEPY_VERSION == 2:
+                        return TextClip(text)
+                    else:
+                        return TextClip(text)
+                except:
+                    raise Exception("Could not create TextClip with any method")
     
     def add_text_overlay(self, text: str, start_time: float = 0, duration: float = None,
                         position: Union[str, Tuple] = 'center', font_size: int = None,
@@ -337,14 +442,14 @@ class VideoCreator:
             self.logger.error(f"Error adding text overlay: {e}")
             raise
     
-    def add_tts_narration(self, text: str, voice: str = None, start_time: float = 0):
-        """Add text-to-speech narration"""
+    def add_tts_narration_with_subtitles(self, text: str, voice: str = None, start_time: float = 0) -> tuple:
+        """Add text-to-speech narration with synchronized subtitles and return duration and word timings"""
         if not self.tts_engine:
             self.logger.warning("No TTS engine configured")
-            return
+            return 0, []
         
         try:
-            # Generate audio
+            # Generate audio with word timings
             temp_audio = tempfile.mktemp(suffix=".wav")
             self.temp_files.append(temp_audio)
             
@@ -352,13 +457,13 @@ class VideoCreator:
                 original_voice = self.tts_engine.config.get("voice")
                 self.tts_engine.speech_config.speech_synthesis_voice_name = voice
             
-            audio_path = self.tts_engine.text_to_audio(text, temp_audio)
+            audio_path, duration, word_timings = self.tts_engine.text_to_audio_with_timing(text, temp_audio)
             
             # Restore original voice
             if voice and 'original_voice' in locals():
                 self.tts_engine.speech_config.speech_synthesis_voice_name = original_voice
             
-            # Add to audio clips - compatible with both MoviePy versions
+            # Add to audio clips
             try:
                 audio_clip = AudioFileClip(audio_path).with_start(start_time)  # MoviePy 2.x
             except AttributeError:
@@ -366,10 +471,137 @@ class VideoCreator:
                 
             self.audio_clips.append(audio_clip)
             
-            self.logger.info(f"Added TTS narration: {text[:50]}...")
+            # Create simplified subtitles (no complex word highlighting for now)
+            self._create_simple_subtitles(text, duration, start_time)
+            
+            self.logger.info(f"Added TTS with subtitles: {text[:50]}... (duration: {duration:.1f}s)")
+            return duration, word_timings
             
         except Exception as e:
-            self.logger.error(f"Error adding TTS narration: {e}")
+            self.logger.error(f"Error adding TTS narration with subtitles: {e}")
+            return 0, []
+    
+    def _create_simple_subtitles(self, text: str, duration: float, start_time: float):
+        """Create simple subtitles without complex highlighting"""
+        try:
+            # Split text into manageable chunks (about 40 characters per line)
+            words = text.split()
+            chunks = []
+            current_chunk = []
+            current_length = 0
+            
+            for word in words:
+                if current_length + len(word) + 1 > 40 and current_chunk:  # +1 for space
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = [word]
+                    current_length = len(word)
+                else:
+                    current_chunk.append(word)
+                    current_length += len(word) + 1
+            
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            
+            # Create subtitle clips for each chunk
+            chunk_duration = duration / len(chunks) if chunks else duration
+            
+            for i, chunk_text in enumerate(chunks):
+                chunk_start = start_time + (i * chunk_duration)
+                
+                # Create subtitle clip
+                subtitle_clip = self._create_text_clip_safe(chunk_text, 44, 'white')
+                
+                # Position at bottom of screen
+                subtitle_position = ('center', self.resolution[1] - 150)
+                
+                # Use MoviePy 2.x compatible methods
+                try:
+                    subtitle_clip = (subtitle_clip
+                                   .with_position(subtitle_position)
+                                   .with_start(chunk_start)
+                                   .with_duration(chunk_duration))
+                    
+                    # Add subtle fade for smooth transitions
+                    try:
+                        subtitle_clip = subtitle_clip.fadein(0.2).fadeout(0.2)
+                    except:
+                        pass  # Skip fade if not supported
+                    
+                except AttributeError:
+                    # Fallback for MoviePy 1.x
+                    subtitle_clip = (subtitle_clip
+                                   .set_position(subtitle_position)
+                                   .set_start(chunk_start)
+                                   .set_duration(chunk_duration))
+                    
+                    # Add subtle fade for smooth transitions
+                    try:
+                        subtitle_clip = subtitle_clip.fadein(0.2).fadeout(0.2)
+                    except:
+                        pass
+                
+                self.text_clips.append(subtitle_clip)
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to create subtitles: {e}")
+            # Fallback: single subtitle for entire text
+            try:
+                simple_text = text[:60] + "..." if len(text) > 60 else text
+                simple_subtitle = self._create_text_clip_safe(simple_text, 40, 'white')
+                
+                # Use MoviePy 2.x compatible methods with fallback
+                try:
+                    simple_subtitle = (simple_subtitle
+                                     .with_position(('center', self.resolution[1] - 150))
+                                     .with_start(start_time)
+                                     .with_duration(duration))
+                except AttributeError:
+                    # Fallback for MoviePy 1.x
+                    simple_subtitle = (simple_subtitle
+                                     .set_position(('center', self.resolution[1] - 150))
+                                     .set_start(start_time)
+                                     .set_duration(duration))
+                
+                self.text_clips.append(simple_subtitle)
+            except Exception as e2:
+                self.logger.error(f"Failed to create fallback subtitle: {e2}")
+                pass
+    
+
+    
+    def _create_word_highlights(self, word_chunk: List[Dict], chunk_text: str, chunk_start: float, start_offset: float):
+        """Create individual word highlight effects"""
+        for i, word_info in enumerate(word_chunk):
+            word = word_info['word']
+            word_start = start_offset + word_info['start_time']
+            word_duration = word_info['duration']
+            
+            # Create highlighted version of the word
+            # We'll create a yellow highlight that appears over the word
+            try:
+                highlight_clip = self._create_text_clip_safe(word, 42, 'yellow')
+                
+                # Position it to align with the word in the subtitle
+                # This is a simplified approach - in a real implementation, you'd calculate exact word positions
+                word_offset = i * 100  # Approximate horizontal offset per word
+                highlight_position = ('center', self.resolution[1] - 150)  # Bottom area
+                
+                highlight_clip = (highlight_clip
+                                .with_position(highlight_position)
+                                .with_start(word_start)
+                                .with_duration(word_duration))
+                
+                # Add fade in/out for smooth highlighting
+                try:
+                    highlight_clip = highlight_clip.fadein(0.1).fadeout(0.1)
+                except:
+                    pass
+                
+                self.text_clips.append(highlight_clip)
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to create word highlight for '{word}': {e}")
+                continue
     
     def add_background_music(self, music_path: str, volume: float = None, loop: bool = True):
         """Add background music"""
@@ -688,48 +920,90 @@ class RedditVideoHandler(VideoCreator):
         
         return '\n'.join(lines)
     
-    def add_reddit_post(self, post_data: Dict, comments: List[Dict] = None):
-        """Add Reddit post with optional comments"""
+    def add_reddit_post_with_subtitles(self, post_data: Dict, comments: List[Dict] = None, use_tts_for_comments: bool = True):
+        """Add Reddit post with subtitle-based comments (no visual bubbles)"""
         
         title = post_data.get("title", "")
-        author = post_data.get("author", "")
-        score = post_data.get("score", 0)
         subreddit = post_data.get("subreddit", "")
         
-        # Add title as main text overlay
+        # Add title as main text overlay (brief display)
         self.add_text_overlay(
             f"r/{subreddit}",
             start_time=0,
-            duration=3,
-            position=('center', 50),
-            font_size=24,
+            duration=2,
+            position=('center', 100),
+            font_size=28,
             animation="fade_in"
         )
         
         self.add_text_overlay(
             title,
-            start_time=0.5,
-            duration=5,
+            start_time=1,
+            duration=4,
             position='center',
-            font_size=32,
+            font_size=36,
             animation="fade_in_out"
         )
         
-        # Add comments as bubbles
-        if comments:
-            comment_start_time = 3
-            for i, comment in enumerate(comments[:5]):  # Limit to 5 comments
-                position = (50, 200 + i * 150)
-                duration = 4
-                
-                bubble_clip = self.create_comment_bubble(
-                    comment, position, comment_start_time, duration
-                )
-                self.text_clips.append(bubble_clip)
-                
-                comment_start_time += 2  # Stagger comment appearances
+        # Process comments with TTS and subtitles only
+        current_time = 6.0  # Start after title display
         
-        self.logger.info(f"Added Reddit post: {title[:30]}...")
+        if comments and use_tts_for_comments and self.tts_engine:
+            for i, comment in enumerate(comments[:3]):  # Limit to 3 comments for better timing
+                comment_text = comment.get("body", "")
+                comment_author = comment.get("author", "Anonymous")
+                
+                # Skip very long comments to keep video manageable
+                if len(comment_text) > 250:
+                    comment_text = comment_text[:247] + "..."
+                
+                # Clean up comment text
+                comment_text = comment_text.replace('\n', ' ').strip()
+                
+                # Create TTS narration with subtitles for the comment
+                narration_text = f"Comment by {comment_author}: {comment_text}"
+                
+                try:
+                    tts_duration, word_timings = self.add_tts_narration_with_subtitles(
+                        narration_text, 
+                        start_time=current_time
+                    )
+                    
+                    # Use actual TTS duration or fallback to estimated duration
+                    if tts_duration > 0:
+                        comment_duration = tts_duration
+                    else:
+                        # Fallback: estimate duration based on text length
+                        comment_duration = len(narration_text) * 0.08  # ~0.08 seconds per character
+                        
+                        # Create simple subtitle as fallback
+                        subtitle_clip = self._create_text_clip_safe(narration_text, 42, 'white')
+                        try:
+                            subtitle_clip = (subtitle_clip
+                                           .with_position(('center', self.resolution[1] - 200))
+                                           .with_start(current_time)
+                                           .with_duration(comment_duration))
+                        except AttributeError:
+                            subtitle_clip = (subtitle_clip
+                                           .set_position(('center', self.resolution[1] - 200))
+                                           .set_start(current_time)
+                                           .set_duration(comment_duration))
+                        
+                        self.text_clips.append(subtitle_clip)
+                    
+                    # Move to next comment after this one finishes
+                    current_time += comment_duration + 1.5  # 1.5 second gap between comments
+                    
+                    self.logger.info(f"Added comment {i+1} with subtitles: {comment_text[:30]}... (duration: {comment_duration:.1f}s)")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing comment {i+1}: {e}")
+                    # Skip this comment and continue
+                    current_time += 3.0  # Add minimal time for failed comment
+                    continue
+        
+        self.logger.info(f"Added Reddit post with subtitles: {title[:30]}...")
+        return current_time  # Return total duration for video length calculation
 
 # Example usage and testing
 def main():
@@ -741,8 +1015,8 @@ def main():
     # TTS configuration (optional - requires Azure Cognitive Services)
     tts_config = {
         "provider": "azure",
-        "speech_key": os.environ.get("AZURE_SPEECH_KEY"),  # Replace with actual key
-        "speech_region": os.environ.get("AZURE_SPEECH_REGION"),   # Replace with actual region
+        "speech_key": "your_speech_key",  # Replace with actual key
+        "speech_region": "your_region",   # Replace with actual region
         "voice": "en-US-AriaNeural"
     }
     
